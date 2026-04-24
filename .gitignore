@@ -1,0 +1,15 @@
+.env
+drata_payloads.json
+drata_payloads.tmp
+drata_state.json
+drata_state.tmp
+dead_letter_*.ndjson
+logs/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+dist/
+*.egg-info/
