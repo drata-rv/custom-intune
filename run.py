@@ -27,6 +27,7 @@ import structlog
 from dotenv import load_dotenv
 
 from clients.intune_client import IntuneClient
+from core.secrets import resolve_aws_secrets
 from pipeline import extractor, publisher
 from pipeline.extractor import ExtractorError
 from pipeline.publisher import PublisherHaltError
@@ -108,6 +109,13 @@ def main() -> None:
     load_dotenv()
     args = _parse_args()
     _configure_logging()
+    # Resolve AWS SM secrets before any client initializes -- writes fetched
+    # values into os.environ so IntuneClient and DrataClient see them normally.
+    try:
+        resolve_aws_secrets()
+    except (ImportError, RuntimeError) as exc:
+        structlog.get_logger("pipeline").critical("secret_resolution_failed", error=str(exc))
+        sys.exit(1)
     asyncio.run(_run(dry_run=args.dry_run))
 
 
