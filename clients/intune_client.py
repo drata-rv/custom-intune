@@ -63,6 +63,14 @@ _COMPLIANCE_POLICIES_URL = (
     "?$select=id,displayName"
 )
 
+# Windows Update Rings live under a separate resource type -- NOT under
+# deviceCompliancePolicies. Querying compliance policies for an Update Ring
+# display name will always return nothing.
+_UPDATE_RINGS_URL = (
+    f"{_GRAPH_BASE}/deviceManagement/windowsUpdateForBusinessConfigurations"
+    "?$select=id,displayName"
+)
+
 # Gentle delay between sequential page requests within a single method call.
 # At 100 devices/page, 25-30 total pages are well below the per-app quota
 # (2,000 req/20 sec), but this keeps us friendly to other tenant consumers.
@@ -74,6 +82,14 @@ def _device_statuses_url(policy_id: str) -> str:
         f"{_GRAPH_BASE}/deviceManagement/deviceCompliancePolicies"
         f"/{policy_id}/deviceStatuses"
         "?$select=id,deviceDisplayName,status,userPrincipalName"
+    )
+
+
+def _update_ring_statuses_url(ring_id: str) -> str:
+    return (
+        f"{_GRAPH_BASE}/deviceManagement/windowsUpdateForBusinessConfigurations"
+        f"/{ring_id}/deviceStatuses"
+        "?$select=id,deviceDisplayName,status"
     )
 
 
@@ -329,6 +345,126 @@ class IntuneClient:
             "policy_statuses_fetched",
             check_type=check_type,
             policy_id=policy_id,
+            total=len(statuses),
+        )
+        return statuses
+
+    async def resolve_update_ring_ids(
+        self,
+        ring_names: dict[str, str],
+    ) -> dict[str, str]:
+        """Resolve Windows Update Ring display names to GUIDs.
+
+        Queries ``/deviceManagement/windowsUpdateForBusinessConfigurations`` --
+        a separate resource type from compliance policies. Update Ring names are
+        never returned by ``resolve_policy_ids`` and vice versa.
+
+        Args:
+            ring_names: {check_type: display_name} for each configured ring.
+
+        Returns:
+            {check_type: ring_id} for display names that matched.
+        """
+        if not ring_names:
+            return {}
+
+        all_rings: list[dict[str, Any]] = []
+        url: str | None = _UPDATE_RINGS_URL
+
+        while url is not None:
+            data = await self._fetch_page(url, self._auth_headers())
+            all_rings.extend(data.get("value", []))
+            url = data.get("@odata.nextLink")
+            if url is not None:
+                await asyncio.sleep(_INTER_PAGE_DELAY_SECONDS)
+
+        ring_id_by_name: dict[str, str] = {
+            r["displayName"].lower(): r["id"]
+            for r in all_rings
+            if r.get("displayName") and r.get("id")
+        }
+
+        resolved: dict[str, str] = {}
+        for check_type, display_name in ring_names.items():
+            ring_id = ring_id_by_name.get(display_name.lower())
+            if ring_id:
+                resolved[check_type] = ring_id
+                logger.info(
+                    "update_ring_resolved",
+                    check_type=check_type,
+                    display_name=display_name,
+                    ring_id=ring_id,
+                )
+            else:
+                logger.warning(
+                    "update_ring_not_found",
+                    check_type=check_type,
+                    display_name=display_name,
+                    hint="Check that the display name matches exactly (case-insensitive) in Intune",
+                )
+
+        return resolved
+
+    async def fetch_update_ring_device_statuses(
+        self,
+        ring_id: str,
+        check_type: str,
+    ) -> list[PolicyDeviceStatus]:
+        """Fetch all device statuses for a Windows Update Ring.
+
+        Queries ``/deviceManagement/windowsUpdateForBusinessConfigurations/{id}/deviceStatuses``.
+        The status vocabulary differs from compliance policies:
+            "succeeded"     -- ring config applied; auto-updates are managed
+            "failed"        -- ring config failed to apply
+            "error"         -- transient error; indeterminate
+            "conflict"      -- policy conflict; indeterminate
+            "notApplicable" -- device not applicable; indeterminate
+            "pending"       -- awaiting policy delivery; indeterminate
+            "unknown"       -- indeterminate
+
+        IMPORTANT: Verify the ``id`` compound-key format during smoke testing.
+        Expected: ``{managedDeviceId}_{userId}`` (same as compliance policies),
+        but confirm against a real tenant response.
+
+        Args:
+            ring_id:    The Update Ring GUID from ``resolve_update_ring_ids()``.
+            check_type: The Drata field name (``"autoUpdateEnabled"``).
+                        Used only for logging.
+
+        Returns:
+            Flat list of all device status records for this ring (all pages).
+        """
+        statuses: list[PolicyDeviceStatus] = []
+        url: str | None = _update_ring_statuses_url(ring_id)
+        page_num = 0
+
+        while url is not None:
+            page_num += 1
+            data = await self._fetch_page(url, self._auth_headers())
+            raw_statuses: list[dict[str, Any]] = data.get("value", [])
+
+            for raw in raw_statuses:
+                status = self._parse_policy_status(raw, check_type)
+                if status is not None:
+                    statuses.append(status)
+
+            logger.debug(
+                "update_ring_status_page_fetched",
+                check_type=check_type,
+                ring_id=ring_id,
+                page=page_num,
+                records_on_page=len(raw_statuses),
+                total_so_far=len(statuses),
+            )
+
+            url = data.get("@odata.nextLink")
+            if url is not None:
+                await asyncio.sleep(_INTER_PAGE_DELAY_SECONDS)
+
+        logger.info(
+            "update_ring_statuses_fetched",
+            check_type=check_type,
+            ring_id=ring_id,
             total=len(statuses),
         )
         return statuses

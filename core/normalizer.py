@@ -80,6 +80,28 @@ def map_compliance_state(status: str) -> bool | None:
     return None
 
 
+def map_update_ring_status(status: str) -> bool | None:
+    """Map a Windows Update Ring ``deviceStatuses.status`` string to a bool or None.
+
+    Update Ring statuses use a different vocabulary from compliance policies.
+    ``"succeeded"`` means the ring configuration was successfully applied --
+    the device is enrolled in the ring and auto-updates are managed.
+    ``"failed"`` means the device is targeted by the ring but the configuration
+    failed to apply -- auto-updates are not properly enforced.
+    All other states (``"error"``, ``"conflict"``, ``"notApplicable"``,
+    ``"pending"``, ``"unknown"``) are indeterminate and return ``None`` so the
+    field is omitted rather than incorrectly emitted.
+
+    Do NOT pass Update Ring statuses to ``map_compliance_state`` -- ``"succeeded"``
+    would be treated as indeterminate there and the field would be silently absent.
+    """
+    if status == "succeeded":
+        return True
+    if status == "failed":
+        return False
+    return None
+
+
 def build_drata_payload(
     intune: IntuneDevice,
     compliance: ComplianceState,

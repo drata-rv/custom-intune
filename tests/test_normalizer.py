@@ -12,6 +12,7 @@ from core.normalizer import (
     build_drata_payload,
     map_compliance_state,
     map_platform,
+    map_update_ring_status,
     normalize_hostname,
     normalize_serial,
 )
@@ -145,6 +146,42 @@ class TestMapComplianceState:
         """Intune sends lowercase -- verify exact match, no accidental case folding."""
         assert map_compliance_state("Compliant") is None
         assert map_compliance_state("COMPLIANT") is None
+
+
+# ── map_update_ring_status ───────────────────────────────────────────────────
+
+class TestMapUpdateRingStatus:
+
+    def test_succeeded_returns_true(self):
+        """Ring config applied successfully -- auto-updates are managed."""
+        assert map_update_ring_status("succeeded") is True
+
+    def test_failed_returns_false(self):
+        """Device is in the ring but config failed -- auto-updates not enforced."""
+        assert map_update_ring_status("failed") is False
+
+    @pytest.mark.parametrize("status", [
+        "error",
+        "conflict",
+        "notApplicable",
+        "pending",
+        "unknown",
+    ])
+    def test_indeterminate_states_return_none(self, status: str):
+        assert map_update_ring_status(status) is None
+
+    def test_unexpected_status_returns_none(self):
+        assert map_update_ring_status("someNewRingStatus") is None
+
+    def test_does_not_accept_compliance_vocabulary(self):
+        """Compliance policy statuses must not accidentally pass as True/False here."""
+        assert map_update_ring_status("compliant") is None
+        assert map_update_ring_status("noncompliant") is None
+
+    def test_does_not_accept_succeeded_variants(self):
+        """Status matching is exact -- no case folding."""
+        assert map_update_ring_status("Succeeded") is None
+        assert map_update_ring_status("SUCCEEDED") is None
 
 
 # ── build_drata_payload ───────────────────────────────────────────────────────

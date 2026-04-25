@@ -4,17 +4,25 @@ Exported function:
     run(intune: IntuneClient) -> list[dict[str, Any]]
 
 Fetches all managed devices from Intune and the per-device compliance states
-for each customer-configured policy, joins them by Intune device GUID, validates
-each merged record via Pydantic, and returns the validated payloads as dicts
-ready for the publisher stage.
+for each customer-configured policy or Update Ring, joins them by Intune device
+GUID, validates each merged record via Pydantic, and returns the validated
+payloads as dicts ready for the publisher stage.
 
-Also writes ``drata_payloads.json`` as a debug artifact so that payloads can be
-inspected without re-running the full extraction. The publisher does not read
-this file -- payloads are passed in memory between stages.
+Two distinct Intune resource types are queried:
+    - Compliance policies (/deviceManagement/deviceCompliancePolicies)
+      for screenLockEnabled, passwordManagerEnabled, encryptionEnabled,
+      antivirusEnabled.
+    - Windows Update Rings (/deviceManagement/windowsUpdateForBusinessConfigurations)
+      for autoUpdateEnabled. Update Rings are NOT compliance policies -- looking
+      up an Update Ring display name against the compliance policy endpoint
+      always returns nothing.
 
-Raises ``ExtractorError`` on unrecoverable failures (zero devices returned,
-file write failure). Per-device validation errors and individual policy fetch
-failures are non-fatal: affected devices or check types are logged and skipped.
+Also writes ``drata_payloads.json`` as a debug artifact. The publisher does not
+read this file -- payloads are passed in memory between stages.
+
+Raises ``ExtractorError`` on unrecoverable failures. Per-device validation errors
+and individual policy/ring fetch failures are non-fatal: affected devices or
+check types are logged and skipped.
 """
 
 from __future__ import annotations
@@ -24,28 +32,36 @@ import json
 import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 import structlog
 from pydantic import ValidationError
 
 from clients.intune_client import IntuneClient
-from core.normalizer import build_drata_payload, map_compliance_state
+from core.normalizer import (
+    build_drata_payload,
+    map_compliance_state,
+    map_update_ring_status,
+)
 from models.source_models import ComplianceState, IntuneDevice, PolicyDeviceStatus
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 PAYLOADS_FILE = Path("drata_payloads.json")
 
-# Maps each Drata compliance field name to the env var holding the customer's
-# Intune policy display name. To add a new compliance check, add one entry here
-# and the corresponding field in DrataDevicePayload.
-POLICY_CHECK_FIELDS: dict[str, str] = {
+# Resolved via /deviceManagement/deviceCompliancePolicies
+_COMPLIANCE_POLICY_FIELDS: dict[str, str] = {
     "screenLockEnabled":      "POLICY_NAME_SCREEN_LOCK",
-    "autoUpdateEnabled":      "POLICY_NAME_AUTO_UPDATES",
     "passwordManagerEnabled": "POLICY_NAME_PASSWORD_MANAGER",
     "encryptionEnabled":      "POLICY_NAME_ENCRYPTION",
     "antivirusEnabled":       "POLICY_NAME_ANTIVIRUS",
+}
+
+# Resolved via /deviceManagement/windowsUpdateForBusinessConfigurations.
+# Update Rings are a separate Intune resource type -- they will never appear
+# in a compliance policy listing and vice versa.
+_UPDATE_RING_FIELDS: dict[str, str] = {
+    "autoUpdateEnabled": "POLICY_NAME_AUTO_UPDATES",
 }
 
 
@@ -53,21 +69,20 @@ class ExtractorError(RuntimeError):
     """Fatal extraction failure -- pipeline cannot continue."""
 
 
-def _read_configured_policies() -> dict[str, str]:
-    """Read POLICY_NAME_* env vars and return {check_type: display_name}.
+def _read_configured_checks(field_map: dict[str, str]) -> dict[str, str]:
+    """Read env vars from ``field_map`` and return {check_type: display_name}.
 
     Logs a WARNING for each unconfigured check type. Returns an empty dict if
-    none are configured -- non-fatal; device identity will still be pushed to
-    Drata, just without any compliance fields.
+    none are set -- non-fatal; those fields will simply be absent from all payloads.
     """
     configured: dict[str, str] = {}
-    for check_type, env_var in POLICY_CHECK_FIELDS.items():
+    for check_type, env_var in field_map.items():
         display_name = os.environ.get(env_var, "").strip()
         if display_name:
             configured[check_type] = display_name
         else:
             logger.warning(
-                "policy_not_configured",
+                "check_not_configured",
                 check_type=check_type,
                 env_var=env_var,
                 hint="Field will be omitted from all payloads",
@@ -76,27 +91,32 @@ def _read_configured_policies() -> dict[str, str]:
 
 
 def _build_compliance_index(
-    policy_results: list[tuple[str, list[PolicyDeviceStatus] | BaseException]],
+    results: list[tuple[str, list[PolicyDeviceStatus] | BaseException]],
+    status_mapper: Callable[[str], Optional[bool]],
 ) -> dict[str, ComplianceState]:
-    """Build a device-id-keyed compliance state index from policy fetch results.
+    """Build a device-id-keyed compliance state index from a set of fetch results.
 
-    For each policy result:
+    ``status_mapper`` translates raw Intune status strings to True/False/None.
+    Pass ``map_compliance_state`` for compliance policy results and
+    ``map_update_ring_status`` for Update Ring results -- the two APIs use
+    different status vocabularies and must not share a mapper.
+
+    For each result:
         - On exception: log ERROR, omit that check type for all devices this run.
-          Better to omit than to emit stale or incorrect data.
-        - On empty list: log WARNING -- policy may have no device assignments.
+        - On empty list: log WARNING -- policy/ring may have no device assignments.
 
-    Only deterministic states (compliant -> True, noncompliant -> False) are
-    stored. A missing key unambiguously means "no reliable data for this check."
+    Only deterministic states (True or False) are stored. A missing key means
+    "no reliable data for this check."
 
     Returns:
         {managedDeviceId: {check_type: bool}}
     """
     index: dict[str, ComplianceState] = defaultdict(dict)
 
-    for check_type, result in policy_results:
+    for check_type, result in results:
         if isinstance(result, BaseException):
             logger.error(
-                "policy_fetch_failed",
+                "check_fetch_failed",
                 check_type=check_type,
                 error=str(result),
                 action="omitting field from all payloads this run",
@@ -107,21 +127,21 @@ def _build_compliance_index(
 
         if not statuses:
             logger.warning(
-                "policy_returned_no_statuses",
+                "check_returned_no_statuses",
                 check_type=check_type,
-                hint="Check policy assignments in Intune -- no devices may be targeted",
+                hint="Check policy/ring assignments in Intune -- no devices may be targeted",
             )
             continue
 
         matched = 0
         for status_record in statuses:
-            value = map_compliance_state(status_record.status)
+            value = status_mapper(status_record.status)
             if value is not None:
                 index[status_record.device_id][check_type] = value
                 matched += 1
 
         logger.info(
-            "compliance_index_built",
+            "check_index_built",
             check_type=check_type,
             total_statuses=len(statuses),
             deterministic_states=matched,
@@ -131,8 +151,26 @@ def _build_compliance_index(
     return dict(index)
 
 
+def _merge_indices(
+    base: dict[str, ComplianceState],
+    overlay: dict[str, ComplianceState],
+) -> dict[str, ComplianceState]:
+    """Merge ``overlay`` into ``base`` in-place and return ``base``.
+
+    Both dicts map managedDeviceId -> {check_type: bool}. Keys from ``overlay``
+    are added to the corresponding device entry in ``base``; they do not overwrite
+    existing check types.
+    """
+    for device_id, checks in overlay.items():
+        if device_id in base:
+            base[device_id].update(checks)
+        else:
+            base[device_id] = checks
+    return base
+
+
 async def run(intune: IntuneClient) -> list[dict[str, Any]]:
-    """Fetch all devices and compliance state from Intune; return validated Drata payloads.
+    """Fetch all devices and compliance/ring state from Intune; return validated Drata payloads.
 
     Args:
         intune: An initialized ``IntuneClient`` within an active async context manager.
@@ -141,52 +179,67 @@ async def run(intune: IntuneClient) -> list[dict[str, Any]]:
         List of serialized Drata device payloads ready to push.
 
     Raises:
-        ExtractorError: Intune returned zero devices, or the debug artifact
-                        could not be written to disk.
+        ExtractorError: Intune returned zero devices, or the device fetch failed entirely.
     """
     logger.info("extractor_start")
 
-    configured_policy_names = _read_configured_policies()
+    configured_compliance = _read_configured_checks(_COMPLIANCE_POLICY_FIELDS)
+    configured_rings = _read_configured_checks(_UPDATE_RING_FIELDS)
 
-    if not configured_policy_names:
+    if not configured_compliance and not configured_rings:
         logger.warning(
-            "no_policies_configured",
+            "no_checks_configured",
             hint="Set at least one POLICY_NAME_* env var to enable compliance checks. "
                  "Device identity will still be pushed to Drata.",
         )
 
-    # Resolve policy display names to GUIDs before the concurrent gather.
-    # Sequential -- a single fast request that must complete before we can
-    # schedule per-policy status fetches.
-    resolved_policy_ids: dict[str, str] = await intune.resolve_policy_ids(
-        configured_policy_names
+    # Resolve display names to GUIDs concurrently -- both are single-page fast
+    # requests and neither depends on the other's result.
+    resolved_compliance_ids, resolved_ring_ids = await asyncio.gather(
+        intune.resolve_policy_ids(configured_compliance),
+        intune.resolve_update_ring_ids(configured_rings),
     )
 
-    missing_policies = [k for k in configured_policy_names if k not in resolved_policy_ids]
+    missing_policies = [k for k in configured_compliance if k not in resolved_compliance_ids]
+    missing_rings = [k for k in configured_rings if k not in resolved_ring_ids]
     if missing_policies:
         logger.warning(
             "policies_not_found_in_intune",
             missing=missing_policies,
             hint="Check that POLICY_NAME_* values match exactly (case-insensitive) in Intune",
         )
+    if missing_rings:
+        logger.warning(
+            "update_rings_not_found",
+            missing=missing_rings,
+            hint="Check that POLICY_NAME_AUTO_UPDATES matches an Update Ring display name, "
+                 "not a compliance policy",
+        )
 
-    # Device inventory and all policy status fetches run concurrently.
-    # return_exceptions=True lets us handle per-task failures without aborting
-    # the entire gather -- a failed policy fetch is non-fatal (fields omitted),
-    # but a failed device fetch is fatal (handled below).
-    policy_fetch_order: list[str] = list(resolved_policy_ids.keys())
+    compliance_fetch_order = list(resolved_compliance_ids.keys())
+    ring_fetch_order = list(resolved_ring_ids.keys())
 
+    # Device inventory, compliance policy statuses, and Update Ring statuses all
+    # run concurrently. return_exceptions=True lets us handle per-task failures
+    # without aborting the entire gather -- a failed policy/ring fetch is
+    # non-fatal (fields omitted), but a failed device fetch is fatal.
     all_results: list[Any] = await asyncio.gather(
         intune.fetch_all_devices(),
         *[
-            intune.fetch_policy_device_statuses(resolved_policy_ids[ct], ct)
-            for ct in policy_fetch_order
+            intune.fetch_policy_device_statuses(resolved_compliance_ids[ct], ct)
+            for ct in compliance_fetch_order
+        ],
+        *[
+            intune.fetch_update_ring_device_statuses(resolved_ring_ids[ct], ct)
+            for ct in ring_fetch_order
         ],
         return_exceptions=True,
     )
 
     device_result = all_results[0]
-    policy_results_raw = all_results[1:]
+    n_compliance = len(compliance_fetch_order)
+    compliance_results_raw = all_results[1 : 1 + n_compliance]
+    ring_results_raw = all_results[1 + n_compliance :]
 
     if isinstance(device_result, BaseException):
         raise ExtractorError(f"Intune device fetch failed: {device_result}")
@@ -199,10 +252,14 @@ async def run(intune: IntuneClient) -> list[dict[str, Any]]:
             "Check Azure AD credentials and admin consent grants."
         )
 
-    policy_results: list[tuple[str, list[PolicyDeviceStatus] | BaseException]] = [
-        (ct, result) for ct, result in zip(policy_fetch_order, policy_results_raw)
-    ]
-    compliance_index = _build_compliance_index(policy_results)
+    # Build separate indices with the correct status mapper for each resource type,
+    # then merge so the join loop sees a unified {device_id: {check_type: bool}}.
+    compliance_results = list(zip(compliance_fetch_order, compliance_results_raw))
+    ring_results = list(zip(ring_fetch_order, ring_results_raw))
+
+    compliance_index = _build_compliance_index(compliance_results, map_compliance_state)
+    ring_index = _build_compliance_index(ring_results, map_update_ring_status)
+    combined_index = _merge_indices(compliance_index, ring_index)
 
     valid_payloads: list[dict[str, Any]] = []
     validation_errors = 0
@@ -212,7 +269,7 @@ async def run(intune: IntuneClient) -> list[dict[str, Any]]:
     for device in intune_devices:
         # Direct GUID join -- Intune is the sole source of truth, so its
         # device IDs are the authoritative join key. No serial/hostname fallback.
-        compliance: ComplianceState = compliance_index.get(device.id, {})
+        compliance: ComplianceState = combined_index.get(device.id, {})
         if compliance:
             compliance_hit_count += 1
 
@@ -235,9 +292,12 @@ async def run(intune: IntuneClient) -> list[dict[str, Any]]:
     logger.info(
         "extractor_summary",
         intune_total=len(intune_devices),
-        configured_checks=list(configured_policy_names.keys()),
-        resolved_policies=list(resolved_policy_ids.keys()),
+        configured_compliance_checks=list(configured_compliance.keys()),
+        configured_ring_checks=list(configured_rings.keys()),
+        resolved_compliance_policies=list(resolved_compliance_ids.keys()),
+        resolved_update_rings=list(resolved_ring_ids.keys()),
         missing_policies=missing_policies,
+        missing_rings=missing_rings,
         devices_with_compliance_data=compliance_hit_count,
         platform_skips=platform_skips,
         validation_errors=validation_errors,
