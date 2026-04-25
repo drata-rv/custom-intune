@@ -17,6 +17,56 @@ rather than minutes.
 - A Drata API key with the "Devices: Create Device" scope
 - A Drata Custom MDM Connection ID (Drata App -> Connections -> MDM -> Custom Device Connection -> Account Information)
 
+## Secrets Management
+
+Production deployments must use AWS Secrets Manager. Direct secret values in
+environment files are only supported for local development.
+
+**Production (AWS Secrets Manager)**
+
+Store `INTUNE_CLIENT_SECRET` and `DRATA_API_KEY` as secrets in AWS SM. Then,
+instead of providing the secret values in the environment, provide the secret
+name or ARN:
+
+```
+INTUNE_CLIENT_SECRET_ID=arn:aws:secretsmanager:us-east-1:123456789:secret:intune-client-secret
+DRATA_API_KEY_ID=arn:aws:secretsmanager:us-east-1:123456789:secret:drata-api-key
+```
+
+At startup, the pipeline fetches the values from AWS SM and injects them into
+the process environment. All other code reads from `os.environ` as normal.
+
+The IAM principal running the pipeline (EC2 instance role, ECS task role,
+Lambda execution role, etc.) must have:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "secretsmanager:GetSecretValue",
+  "Resource": [
+    "arn:aws:secretsmanager:...:secret:intune-client-secret",
+    "arn:aws:secretsmanager:...:secret:drata-api-key"
+  ]
+}
+```
+
+Secrets may be stored as a plain string or a JSON object. For JSON objects, the
+pipeline uses the key that matches the target variable name (e.g.,
+`INTUNE_CLIENT_SECRET`), or the value of a single-key object. A JSON object
+with multiple keys and no matching key name will raise an error at startup.
+
+**Local development**
+
+Set the secret values directly in `.env`:
+
+```
+INTUNE_CLIENT_SECRET=your-client-secret
+DRATA_API_KEY=your-drata-api-key
+```
+
+Do not commit `.env`. The `*_SECRET_ID` variables take precedence when set, so
+ensure they are unset or empty in your local `.env`.
+
 ## Setup
 
 **1. Install dependencies**
@@ -33,10 +83,12 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and fill in the values. The three Intune credentials and two Drata
-variables are required. The five `POLICY_NAME_*` variables are optional -- omit
-any whose corresponding Intune policy does not exist yet, and that compliance
-field will simply be absent from all payloads.
+Edit `.env` and fill in the values. For local development, set
+`INTUNE_CLIENT_SECRET` and `DRATA_API_KEY` directly. For production, set the
+corresponding `*_SECRET_ID` variables instead (see Secrets Management above).
+The five `POLICY_NAME_*` variables are optional -- omit any whose corresponding
+Intune policy does not exist yet, and that compliance field will be absent from
+all payloads.
 
 **3. Verify with a dry run**
 
@@ -66,20 +118,29 @@ python run.py 2>&1 | jq .
 |---|---|---|
 | `INTUNE_TENANT_ID` | Yes | Azure AD Directory (tenant) ID |
 | `INTUNE_CLIENT_ID` | Yes | App Registration Application (client) ID |
-| `INTUNE_CLIENT_SECRET` | Yes | App Registration client secret |
-| `DRATA_API_KEY` | Yes | Drata API key with "Devices: Create Device" scope |
+| `INTUNE_CLIENT_SECRET` | Local dev | App Registration client secret (direct value) |
+| `INTUNE_CLIENT_SECRET_ID` | Production | AWS SM secret name or ARN for the client secret |
+| `DRATA_API_KEY` | Local dev | Drata API key with "Devices: Create Device" scope (direct value) |
+| `DRATA_API_KEY_ID` | Production | AWS SM secret name or ARN for the Drata API key |
 | `DRATA_CONNECTION_ID` | Yes | Numeric Drata Custom MDM Connection ID |
-| `POLICY_NAME_SCREEN_LOCK` | No | Display name of Intune policy for screen lock check |
-| `POLICY_NAME_AUTO_UPDATES` | No | Display name of Intune policy for auto-updates check |
-| `POLICY_NAME_PASSWORD_MANAGER` | No | Display name of Intune policy for password manager check |
-| `POLICY_NAME_ENCRYPTION` | No | Display name of Intune policy for encryption check |
-| `POLICY_NAME_ANTIVIRUS` | No | Display name of Intune policy for antivirus check |
+| `POLICY_NAME_SCREEN_LOCK` | No | Display name of the Intune compliance policy for screen lock |
+| `POLICY_NAME_AUTO_UPDATES` | No | Display name of the Windows Update Ring (not a compliance policy) |
+| `POLICY_NAME_PASSWORD_MANAGER` | No | Display name of the Intune compliance policy for password manager |
+| `POLICY_NAME_ENCRYPTION` | No | Display name of the Intune compliance policy for encryption |
+| `POLICY_NAME_ANTIVIRUS` | No | Display name of the Intune compliance policy for antivirus |
 | `STATE_FILE_PATH` | No | Override default state file location (default: `./drata_state.json`) |
 | `LOG_LEVEL` | No | `DEBUG`, `INFO`, `WARNING`, or `ERROR` (default: `INFO`) |
 
-Policy display names are matched case-insensitively against the names in your
-Intune tenant. If a name does not match any policy, the pipeline logs a warning
-and omits that compliance field from all payloads for that run.
+Set either the direct value or the `*_SECRET_ID` variant for each secret, not both.
+When a `*_SECRET_ID` var is set, the direct value is ignored for that run.
+
+`POLICY_NAME_AUTO_UPDATES` must match a Windows Update Ring display name under
+`/deviceManagement/windowsUpdateForBusinessConfigurations`, not a compliance
+policy. Update Rings and compliance policies are separate Intune resource types.
+All other `POLICY_NAME_*` variables match compliance policies under
+`/deviceManagement/deviceCompliancePolicies`. Display names are matched
+case-insensitively. If a name does not match, the pipeline logs a warning and
+omits that compliance field from all payloads for that run.
 
 ## Scheduling as a Cron Job
 
@@ -143,8 +204,8 @@ jobs:
         env:
           INTUNE_TENANT_ID: ${{ secrets.INTUNE_TENANT_ID }}
           INTUNE_CLIENT_ID: ${{ secrets.INTUNE_CLIENT_ID }}
-          INTUNE_CLIENT_SECRET: ${{ secrets.INTUNE_CLIENT_SECRET }}
-          DRATA_API_KEY: ${{ secrets.DRATA_API_KEY }}
+          INTUNE_CLIENT_SECRET_ID: ${{ secrets.INTUNE_CLIENT_SECRET_ID }}
+          DRATA_API_KEY_ID: ${{ secrets.DRATA_API_KEY_ID }}
           DRATA_CONNECTION_ID: ${{ secrets.DRATA_CONNECTION_ID }}
           POLICY_NAME_SCREEN_LOCK: ${{ vars.POLICY_NAME_SCREEN_LOCK }}
           POLICY_NAME_AUTO_UPDATES: ${{ vars.POLICY_NAME_AUTO_UPDATES }}
