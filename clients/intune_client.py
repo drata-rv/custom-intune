@@ -42,7 +42,6 @@ from tenacity import (
     retry,
     retry_if_exception,
     stop_after_attempt,
-    wait_base,
     wait_exponential,
 )
 
@@ -129,14 +128,15 @@ def _is_retryable(exc: BaseException) -> bool:
     )
 
 
-class _GraphAPIWait(wait_base):
+class _GraphAPIWait:
     """Tenacity wait strategy for Microsoft Graph API retries.
 
     On 429: respect the server's Retry-After or x-ms-retry-after-ms header.
     On 5xx: fall back to standard exponential backoff (min 2s, max 60s).
 
-    This replaces the prior double-sleep pattern (header sleep + backoff sleep)
-    by handling both in a single callback -- only one sleep occurs per retry.
+    Intentionally does NOT subclass wait_base -- tenacity accepts any callable
+    (RetryCallState) -> float as a wait strategy. Avoiding the inheritance removes
+    coupling to tenacity internals that changed in v9.0 and broke deployments.
     """
 
     _exp = wait_exponential(multiplier=1, min=2, max=60)
