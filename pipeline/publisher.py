@@ -197,8 +197,15 @@ async def run(
                 attempts += 1
                 resp = await drata.upsert_device(client, payload)
 
-                if resp.status_code == 201:
-                    logger.info("device_pushed", external_id=external_id)
+                if resp.status_code in {200, 201}:
+                    # 201 = created (new device), 200 = updated (existing device).
+                    # Drata's upsert returns both -- treating only 201 as success
+                    # caused every update to be retried 5x and dead-lettered.
+                    logger.info(
+                        "device_pushed",
+                        external_id=external_id,
+                        action="created" if resp.status_code == 201 else "updated",
+                    )
                     state.record_success(external_id, payload)
                     success_count += 1
                     return
