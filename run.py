@@ -119,5 +119,28 @@ def main() -> None:
     asyncio.run(_run(dry_run=args.dry_run))
 
 
+def lambda_handler(event: dict, context: object) -> dict:
+    """AWS Lambda entry point -- invoked by EventBridge schedule or manual test.
+
+    Bypasses argparse entirely. Dry-run mode can be enabled by setting the
+    DRY_RUN=true environment variable in the Lambda function configuration.
+
+    The handler intentionally lets unhandled exceptions propagate so that
+    Lambda marks the invocation as failed and CloudWatch captures the full
+    traceback -- cleaner than swallowing errors and returning a 200.
+    """
+    _configure_logging()
+
+    try:
+        resolve_aws_secrets()
+    except (ImportError, RuntimeError) as exc:
+        structlog.get_logger("pipeline").critical("secret_resolution_failed", error=str(exc))
+        raise
+
+    dry_run = os.environ.get("DRY_RUN", "").strip().lower() == "true"
+    asyncio.run(_run(dry_run=dry_run))
+    return {"statusCode": 200, "body": "pipeline_complete"}
+
+
 if __name__ == "__main__":
     main()

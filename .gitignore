@@ -13,3 +13,7 @@ __pycache__/
 .mypy_cache/
 dist/
 *.egg-info/
+
+# Lambda build artifacts
+.build/
+*.zip
